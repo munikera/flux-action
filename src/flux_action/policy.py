@@ -20,6 +20,7 @@ training, EMA and training-state resume are not implemented here.
 from __future__ import annotations
 
 import json
+import os
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
@@ -304,11 +305,15 @@ class FluxActionPolicy(nn.Module):
         self.config.single_frame_encode = True
         if isinstance(self.dit, JointSingleSeq):
             dims = _prepared_bf16_dims(self.config)
-            if dims is None or self.device.type != "cuda":
+            if dims is None or self.device.type not in ("cuda", "xpu"):
                 return False
             from .models.transformer_inf_bf16 import BF16InferenceDiT
 
-            self.dit = BF16InferenceDiT.from_state_dict(self.dit.state_dict(), dims)
+            # Hand the weights over and drop the unpacked module, so packing frees each block's separate
+            # projections as it fuses them; otherwise both copies coexist (about 8.5 GB more at peak).
+            state = dict(self.dit.state_dict())
+            self.dit = None
+            self.dit = BF16InferenceDiT.from_state_dict(state, dims, consume=True)
             self.reset()
         elif self.config.quantization == "fp8r":
             assert _released_inference_config(self.config), (
@@ -566,15 +571,20 @@ class FluxActionPolicy(nn.Module):
                 self._prepared_text_cache.clear()
                 todo = sorted(wanted)
             encoder = self.text_encoder
+            # $F3_TEXT_ENCODER_DEVICE=cpu: with offload, encode on the CPU and move only the contexts, for GPUs
+            # that cannot hold the 8.9 GB encoder next to the prepared policy (24 GB cards). Once per caption.
+            on_cpu = self._offload_text_encoder and os.environ.get("F3_TEXT_ENCODER_DEVICE") == "cpu"
             try:
-                if self._offload_text_encoder:
+                if self._offload_text_encoder and not on_cpu:
                     encoder.to(device)
-                encoded = text_contexts(encoder, todo, device, fixed_length=fixed_length)
+                encoded = text_contexts(encoder, todo, torch.device("cpu") if on_cpu else device, fixed_length=fixed_length)
+                if on_cpu:
+                    encoded = [ctx.to(device) for ctx in encoded]
             finally:
-                if self._offload_text_encoder:
+                if self._offload_text_encoder and not on_cpu:
                     encoder.to("cpu")
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
+                    if device.type in ("cuda", "xpu"):
+                        torch.get_device_module(device).empty_cache()
             for caption, ctx in zip(todo, encoded, strict=True):
                 self._ctx_cache[keys[caption]] = (
                     ctx.to(self.dtype_),
@@ -736,7 +746,7 @@ class FluxActionPolicy(nn.Module):
         elif prepared.event is not None:
             # encoded on another stream: order this stream after it and keep the tensors' memory from
             # being recycled while it is still in use here
-            stream = torch.cuda.current_stream()
+            stream = torch.get_device_module(self.device).current_stream()
             stream.wait_event(prepared.event)
             for tensor in prepared.tensors():
                 tensor.record_stream(stream)
@@ -845,7 +855,7 @@ class FluxActionPolicy(nn.Module):
                     for i in idx[start : start + cfg.vae_batch_windows]
                 ]
             )  # (nb, 3, T, Hc, Wc)
-            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type in ("cuda", "xpu")):
                 latents.append(
                     history.encode_windows(self.video_vae, videos, cfg)
                     if cfg.inference_profile == "history"

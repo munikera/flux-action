@@ -253,8 +253,10 @@ class _ModeBlock(nn.Module):
         shift, scale, gate = modulation
         modulated = (1 + scale) * self.pre_norm(x) + shift
         batch, length, _ = modulated.shape
-        assert self.in_proj_weight is not None, "input projection is not packed"
-        q, k, v, mlp = F.linear(modulated, self.in_proj_weight).split(
+        int8 = getattr(self, "in_proj_int8", None)  # set by int8_w8a8.quantize_prepared_dit
+        assert int8 is not None or self.in_proj_weight is not None, "input projection is not packed"
+        projected = int8(modulated) if int8 is not None else F.linear(modulated, self.in_proj_weight)
+        q, k, v, mlp = projected.split(
             (self.hidden_size, self.hidden_size, self.hidden_size, 2 * self.mlp_hidden_dim), dim=-1
         )
         q = q.reshape(batch, length, self.num_heads, -1).transpose(1, 2)
@@ -334,8 +336,10 @@ class _JointBlock(nn.Module):
     ) -> Tensor:
         modulated = _modulate_segments(self.pre_norm(sequence), lengths, modulations)
         batch, length, _ = modulated.shape
-        assert self.in_proj_weight is not None, "input projection is not packed"
-        q, k, v, mlp = F.linear(modulated, self.in_proj_weight).split(
+        int8 = getattr(self, "in_proj_int8", None)  # set by int8_w8a8.quantize_prepared_dit
+        assert int8 is not None or self.in_proj_weight is not None, "input projection is not packed"
+        projected = int8(modulated) if int8 is not None else F.linear(modulated, self.in_proj_weight)
+        q, k, v, mlp = projected.split(
             (self.hidden_size, self.hidden_size, self.hidden_size, 2 * self.mlp_hidden_dim), dim=-1
         )
         q = q.reshape(batch, length, self.num_heads, -1).transpose(1, 2)
@@ -402,8 +406,13 @@ class BF16InferenceDiT(nn.Module):
         self._packed = False
 
     @classmethod
-    def from_state_dict(cls, state_dict: Mapping[str, Tensor], dims: Dims = Dims()) -> BF16InferenceDiT:
-        """Strictly load materialized BF16 tensors; stream names and channels come from ``emb_in``."""
+    def from_state_dict(
+        cls, state_dict: Mapping[str, Tensor], dims: Dims = Dims(), *, consume: bool = False
+    ) -> BF16InferenceDiT:
+        """Strictly load materialized BF16 tensors; stream names and channels come from ``emb_in``.
+
+        With ``consume`` the (mutable) ``state_dict`` is emptied once loaded, so the model holds the only
+        references and packing releases the unpacked projections block by block."""
         in_channels = {
             name.removeprefix("emb_in.").removesuffix(".weight"): tensor.shape[1]
             for name, tensor in state_dict.items()
@@ -416,6 +425,8 @@ class BF16InferenceDiT(nn.Module):
         assert len(devices) == 1 and next(iter(devices)).type != "meta", "weights need one real device"
         assert dtypes == {torch.bfloat16}, "expected BF16 weights"
         model.load_state_dict(state_dict, strict=True, assign=True)
+        if consume:
+            state_dict.clear()
         model._pack_for_inference()
         model.eval()
         return model
@@ -462,7 +473,7 @@ class BF16InferenceDiT(nn.Module):
 
     def validate_runtime_device(self) -> None:
         device, _ = self._weight_spec()
-        assert device.type == "cuda", "prepare after CUDA placement"
+        assert device.type in ("cuda", "xpu"), "prepare after GPU placement"
 
     def _embed_timestep(self, timestep: Tensor) -> Tensor:
         with torch.autocast(device_type=timestep.device.type, enabled=False):

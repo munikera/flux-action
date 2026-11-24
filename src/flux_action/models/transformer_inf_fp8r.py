@@ -619,6 +619,8 @@ class FP8RInferenceDiT(nn.Module):
 
     @staticmethod
     def _check_runtime_device(device: torch.device) -> None:
+        if device.type == "xpu":
+            return  # torch._scaled_mm runs rowwise E4M3 on XPU; on Arc Pro B70 it is slower than BF16
         assert device.type == "cuda", "native FP8r inference requires CUDA"
         capability = torch.cuda.get_device_capability(device)
         supported = {(8, 9), (9, 0), (10, 0), (10, 3), (12, 0)}

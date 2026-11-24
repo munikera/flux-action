@@ -24,6 +24,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa: N812
 from natten.functional import na2d, na3d
+import natten.backends.configs.checks as _natten_checks
+
+# NATTEN's Flex Attention backend is plain PyTorch (compiled through Triton), which also runs on Intel
+# XPU, but its device check only admits CUDA, ROCm and CPU. Admit XPU through the ROCm branch, which
+# skips the CUDA compute-capability test; NATTEN's CUTLASS backends stay CUDA-only.
+_natten_is_rocm = _natten_checks.is_rocm
+_natten_checks.is_rocm = lambda device: device.type == "xpu" or _natten_is_rocm(device)
 from torch import Tensor
 
 logger = logging.getLogger(__name__)
@@ -334,11 +341,103 @@ class Natten3D(nn.Module):
         if q.shape[1] == 1:
             q2, k2, v2 = q.squeeze(1), k.squeeze(1), v.squeeze(1)
             kernel = self.window_size[1:]
+            if _use_gather_na2d(q2, kernel):
+                if os.environ.get("F3_NA2D") != "gather" and min(q2.shape[1:3]) >= _NA2D_TILE + max(kernel) - 1:
+                    return _na2d_tiled(q2, k2, v2, kernel).unsqueeze(1)
+                return _na2d_gather(q2, k2, v2, kernel).unsqueeze(1)
             kwargs = _natten_attention_kwargs(q2, k2, v2, kernel_size=kernel)
             return na2d(q2, k2, v2, kernel_size=kernel, attention_kwargs=kwargs).unsqueeze(1)
         causal = [self.causal, False, False]
         kwargs = _natten_attention_kwargs(q, k, v, kernel_size=self.window_size, is_causal=causal)
         return na3d(q, k, v, is_causal=causal, kernel_size=self.window_size, attention_kwargs=kwargs)
+
+
+def _use_gather_na2d(q: Tensor, kernel_size) -> bool:
+    """Gathered 2-D neighborhood attention on XPU (or with $F3_NA2D=gather); $F3_NA2D=natten forces NATTEN.
+
+    NATTEN has no XPU kernels; its Flex Attention fallback builds the block mask from a dense
+    ``(H*W)^2`` index computation (4.7 GiB at 90x160) on every call. Odd windows without dilation, the
+    only kind the VAE uses, are a direct gather instead."""
+    mode = os.environ.get("F3_NA2D", "")
+    if mode == "natten":
+        return False
+    odd = all(kk % 2 == 1 and kk <= n for kk, n in zip(kernel_size, q.shape[1:3], strict=True))
+    return odd and (mode == "gather" or q.device.type == "xpu")
+
+
+def _neighborhood_index(n: int, kernel: int, device) -> Tensor:
+    """``(n, kernel)`` key positions for each query position: NATTEN's window, shifted inward at the borders."""
+    start = (torch.arange(n, device=device) - kernel // 2).clamp(0, n - kernel)
+    return start[:, None] + torch.arange(kernel, device=device)
+
+
+def _na2d_gather(q: Tensor, k: Tensor, v: Tensor, kernel_size) -> Tensor:
+    """Exact NATTEN ``na2d`` (odd kernel, stride 1, no dilation, non-causal) for ``(B, H, W, heads, dim)``."""
+    b, h, w, heads, dim = q.shape
+    kh, kw = kernel_size
+    rows = _neighborhood_index(h, kh, q.device)[:, None, :, None]  # (H, 1, kh, 1)
+    cols = _neighborhood_index(w, kw, q.device)[None, :, None, :]  # (1, W, 1, kw)
+    keys = k[:, rows, cols].reshape(b, h, w, kh * kw, heads, dim)
+    values = v[:, rows, cols].reshape(b, h, w, kh * kw, heads, dim)
+    scores = torch.einsum("bxyhd,bxynhd->bxyhn", q.float(), keys.float()) * dim**-0.5
+    probs = scores.softmax(dim=-1).to(v.dtype)
+    return torch.einsum("bxyhn,bxynhd->bxyhd", probs, values)
+
+
+_NA2D_TILE = int(os.environ.get("F3_NA2D_TILE", "8"))
+_tile_masks: dict[tuple, tuple[Tensor, Tensor, Tensor]] = {}
+
+
+def _tile_layout(n: int, kernel: int, tile: int, device) -> tuple[Tensor, Tensor]:
+    """Halo start per tile and the window start per (padded) query along one axis.
+
+    Every window of a tile's queries lies inside ``[halo_start, halo_start + tile + kernel - 1)``."""
+    halo = min(tile + kernel - 1, n)
+    tiles = -(-n // tile)
+    q = torch.arange(tiles * tile, device=device).clamp(max=n - 1)
+    win = (q - kernel // 2).clamp(0, n - kernel)  # NATTEN's window start, shifted inward at the borders
+    halo_start = win.reshape(tiles, tile)[:, 0].clamp(max=n - halo)
+    return halo_start, win
+
+
+def _na2d_tiled(q: Tensor, k: Tensor, v: Tensor, kernel_size) -> Tensor:
+    """Exact NATTEN ``na2d`` (odd kernel, stride 1, no dilation, non-causal) as masked SDPA over query tiles.
+
+    Queries are split into ``tile x tile`` tiles; a tile attends to its halo of ``(tile + k - 1)^2`` keys with a
+    mask that keeps exactly each query's window, so keys are read about 2x instead of k^2 times."""
+    b, h, w, heads, dim = q.shape
+    kh, kw = kernel_size
+    tile = _NA2D_TILE
+    key = (h, w, kh, kw, tile, q.device)
+    if key not in _tile_masks:
+        hs, wr = _tile_layout(h, kh, tile, q.device)
+        ws, wc = _tile_layout(w, kw, tile, q.device)
+        th, tw = len(hs), len(ws)
+        lh, lw = min(tile + kh - 1, h), min(tile + kw - 1, w)
+        rows = hs[:, None] + torch.arange(lh, device=q.device)  # (th, lh) halo key rows
+        cols = ws[:, None] + torch.arange(lw, device=q.device)  # (tw, lw)
+        # query (ti, a) keeps key row r iff win_row <= r < win_row + kh; likewise for columns
+        qr = wr.reshape(th, tile)  # window start of each query row in each tile
+        qc = wc.reshape(tw, tile)
+        row_ok = (rows[:, None, :] >= qr[:, :, None]) & (rows[:, None, :] < qr[:, :, None] + kh)  # (th, tile, lh)
+        col_ok = (cols[:, None, :] >= qc[:, :, None]) & (cols[:, None, :] < qc[:, :, None] + kw)  # (tw, tile, lw)
+        mask = row_ok[:, None, :, None, :, None] & col_ok[None, :, None, :, None, :]  # (th, tw, tile, tile, lh, lw)
+        _tile_masks[key] = (rows, cols, mask.reshape(th * tw, 1, tile * tile, lh * lw))
+    rows, cols, mask = _tile_masks[key]
+    th, lh = rows.shape
+    tw, lw = cols.shape
+    # keys/values of each tile's halo: (B, th, tw, heads, lh*lw, dim)
+    kt = k[:, rows[:, :, None, None], cols[None, None, :, :]]  # (B, th, lh, tw, lw, heads, dim)
+    vt = v[:, rows[:, :, None, None], cols[None, None, :, :]]
+    kt = kt.permute(0, 1, 3, 5, 2, 4, 6).reshape(b * th * tw, heads, lh * lw, dim)
+    vt = vt.permute(0, 1, 3, 5, 2, 4, 6).reshape(b * th * tw, heads, lh * lw, dim)
+    # queries padded to whole tiles: (B, th, tw, heads, tile*tile, dim)
+    pad_h, pad_w = th * tile - h, tw * tile - w
+    qp = F.pad(q, (0, 0, 0, 0, 0, pad_w, 0, pad_h)) if pad_h or pad_w else q
+    qt = qp.reshape(b, th, tile, tw, tile, heads, dim).permute(0, 1, 3, 5, 2, 4, 6).reshape(b * th * tw, heads, tile * tile, dim)
+    out = F.scaled_dot_product_attention(qt, kt, vt, attn_mask=mask.repeat(b, 1, 1, 1))
+    out = out.reshape(b, th, tw, heads, tile, tile, dim).permute(0, 1, 4, 2, 5, 3, 6).reshape(b, th * tile, tw * tile, heads, dim)
+    return out[:, :h, :w]
 
 
 class GLU_MLP(nn.Module):  # noqa: N801 (vendored name)
@@ -793,7 +892,7 @@ class ViTNormInference(nn.Module):
                 f"chunk_size/overlap latent frames must be >= 1, got core={core}, overlap={overlap}"
             )
         # Shrink core if free VRAM can't hold a full window (core + 2*overlap).
-        free, _ = torch.cuda.mem_get_info(z.device)
+        free, _ = torch.get_device_module(z.device).mem_get_info(z.device)
         budget = free / DECODE_SAFETY_FACTOR - DECODE_FIXED_BYTES
         window_fit = int(budget / (DECODE_BYTES_PER_LATENT_ELEM * z[0, 0, 0].numel()))
         core = max(1, min(core, window_fit - 2 * overlap))
@@ -822,9 +921,9 @@ class ViTNormInference(nn.Module):
         return out
 
     def _full_decode_fits(self, z: Tensor) -> bool:
-        if z.device.type != "cuda":
+        if z.device.type not in ("cuda", "xpu"):
             return True
-        free, _ = torch.cuda.mem_get_info(z.device)
+        free, _ = torch.get_device_module(z.device).mem_get_info(z.device)
         need = DECODE_BYTES_PER_LATENT_ELEM * z[0, 0].numel() + DECODE_FIXED_BYTES
         return need * DECODE_SAFETY_FACTOR < free
 
@@ -849,7 +948,7 @@ class ViTNormInference(nn.Module):
                 if not (auto and self.chunked_decode):
                     raise
                 logger.warning(f"full video decode OOM (t_latent={z.shape[2]}), falling back to chunked")
-                torch.cuda.empty_cache()
+                torch.get_device_module(z.device).empty_cache()
         z = self.model.z_normalizer.denormalize(z)
         return self.min_chunk_dec(z).clamp(-1, 1)
 
@@ -910,6 +1009,11 @@ class VideoVAE:
     def encode_frame(self, frame: Tensor) -> Tensor:
         """``(B, 3, H, W)`` -> ``(B, 96, 1, H // 32, W // 32)``: the frame alone, without the 45-frame padding
         of ``encode``. See ``PolicyConfig.single_frame_encode``."""
+        # $F3_VAE_FRAME_CHUNK frames at a time (0: all at once). A 360x640 frame peaks at about 12.6 GB on the
+        # flex-fna path, so a 32 GB card encodes a robot's three cameras one by one; the result is the same.
+        chunk = int(os.environ.get("F3_VAE_FRAME_CHUNK", "0"))
+        if 0 < chunk < frame.shape[0]:
+            return torch.cat([self._model.encode(f[:, :, None], chunked_encode=False) for f in frame.split(chunk)])
         return self._model.encode(frame[:, :, None], chunked_encode=False)
 
     @torch.inference_mode()
