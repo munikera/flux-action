@@ -1,0 +1,55 @@
+Loading weights:   0%|          | 0/713 [00:00<?, ?it/s]Loading weights: 100%|██████████| 713/713 [00:00<00:00, 18510.51it/s]
+[transformers] The tokenizer you are loading from 'black-forest-labs/flux-3-action-base' with an incorrect regex pattern: https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/discussions/84#69121093e8b480e709447d5e. This will lead to incorrect tokenization. You should set the `fix_mistral_regex=True` flag when loading this tokenizer to fix this issue.
+after prepare: 16.36 GB allocated
+{"batch": 1, "latency_ms": 1738.2, "p99_ms": 1742.7, "queries_per_s": 0.58, "first_call_s": 1.7, "peak_mem_gb": 18.43, "actions_shape": [1, 32, 8]}
+{"batch": 2, "latency_ms": 3489.9, "p99_ms": 3492.9, "queries_per_s": 0.57, "first_call_s": 3.5, "peak_mem_gb": 18.45, "actions_shape": [2, 32, 8]}
+{"batch": 4, "latency_ms": 7008.2, "p99_ms": 7020.4, "queries_per_s": 0.57, "first_call_s": 7.0, "peak_mem_gb": 18.48, "actions_shape": [4, 32, 8]}
+{
+  "device": "Intel(R) Arc(TM) Pro B70 Graphics",
+  "torch": "2.14.1+xpu",
+  "subfolder": "variants/gd",
+  "compile": false,
+  "prepared_backend": true,
+  "load_s": 16.0,
+  "rows": [
+    {
+      "batch": 1,
+      "latency_ms": 1738.2,
+      "p99_ms": 1742.7,
+      "queries_per_s": 0.58,
+      "first_call_s": 1.7,
+      "peak_mem_gb": 18.43,
+      "actions_shape": [
+        1,
+        32,
+        8
+      ]
+    },
+    {
+      "batch": 2,
+      "latency_ms": 3489.9,
+      "p99_ms": 3492.9,
+      "queries_per_s": 0.57,
+      "first_call_s": 3.5,
+      "peak_mem_gb": 18.45,
+      "actions_shape": [
+        2,
+        32,
+        8
+      ]
+    },
+    {
+      "batch": 4,
+      "latency_ms": 7008.2,
+      "p99_ms": 7020.4,
+      "queries_per_s": 0.57,
+      "first_call_s": 7.0,
+      "peak_mem_gb": 18.48,
+      "actions_shape": [
+        4,
+        32,
+        8
+      ]
+    }
+  ]
+}

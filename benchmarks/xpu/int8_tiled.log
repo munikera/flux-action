@@ -1,0 +1,11 @@
+bf16_tiled: 313.4 ms per query (p99 313.7), peak 25.34 GB
+bf16_tiled vs bf16: joints max 0.0234 rad, mean 0.0025 rad; gripper max 0.0078; action range -1.84..1.22
+int8: 159 GEMMs converted; 9.86 GB allocated
+int8_tiled: 243.2 ms per query (p99 243.4), peak 18.85 GB
+int8_tiled vs bf16: joints max 0.1406 rad, mean 0.0210 rad; gripper max 0.0937; action range -1.84..1.22
+compile variants/sd Intel(R) Arc(TM) Pro B70 Graphics
+    of which encode_frame: 22 ms
+  observation encode (3 cameras, video VAE): 22 ms
+  DiT sampler: 290 ms
+  total predict_action_chunk: 313 ms
+TILED DONE

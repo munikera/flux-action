@@ -1,0 +1,7 @@
+bf16: 340.7 ms per query (p99 341.0), peak 25.33 GB
+bf16_rerun: 341.4 ms per query (p99 341.6), peak 25.33 GB
+bf16_rerun vs bf16: joints max 0.0156 rad, mean 0.0007 rad; gripper max 0.0078; action range -1.84..1.22
+int8: 159 GEMMs converted; 9.86 GB allocated
+int8: 271.7 ms per query (p99 271.9), peak 18.84 GB
+int8 vs bf16: joints max 0.1484 rad, mean 0.0211 rad; gripper max 0.0937; action range -1.84..1.22
+INT8 AB DONE
